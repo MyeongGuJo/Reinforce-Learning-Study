@@ -1,15 +1,202 @@
+import numpy as np
+import torch
+from torch import nn
+from collections import deque
+import random, copy
+
 class Mario:
     def __init__(self, state_dim, action_dim, save_dir):
-        pass
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        self.save_dir = save_dir
+
+        self.device = "cuda:1" if torch.cuda.is_available() else "cpu"
+
+        self.net = MarioNet(self.state_dim, self.action_dim).float()
+        self.net = self.net.to(device=self.device)
+
+        self.exploration_rate = 1
+        self.exploration_rate_decay = 0.99999975
+        self.exploration_rate_min = 0.1
+        self.curr_step = 0
+
+        self.save_every = 5e5 # experience count between storing in Mario Net
+
+        self.memory = deque(maxlen=100000)
+        self.batch_size = 32
+
+        self.gamma = 0.9
+
+        self.optimizer = torch.optim.Adam(self.net.parameters(), lr=0.00025)
+        self.loss_fn = torch.nn.SmoothL1Loss()
+
+        self.burnin = 1e4 # min of experience value before train
+        self.learn_every = 3 # count of experience between Q_online update
+        self.sync_every = 1e4 # count of experience between Q_target and Q_online sync
 
     def act(self, state):
-        pass
+        """
+        In given state, choose Epsilon-Greedy action
+            and update value of step
+        
+        input:
+            state("LazyFrame"): observation in current state.
+                dimension: state_dim
+        
+        output:
+            "action_idx"(int): integer for action mario will do
+        """
+        # choose arbitary action
+        if np.random.rand() < self.exploration_rate:
+            action_idx = np.random.randint(self.action_dim)
 
-    def cache(self, experience):
-        pass
+        # use optimal action
+        else:
+            state = state[0].__array__() if isinstance(state, tuple) else state.__array__()
+            state = torch.tensor(state, device=self.device).unsqueeze(0)
+            action_values = self.net(state, model="online")
+            action_idx = torch.argmax(action_values, axis=1).item()
+
+        # decrease exploration_rate
+        self.exploration_rate *= self.exploration_rate_decay
+        self.exploration_rate = max(self.exploration_rate_min, self.exploration_rate)
+
+        # increase step count
+        self.curr_step += 1
+        return action_idx
+
+    def cache(self, state, next_state, action, reward, done):
+        """
+        Store the experience to self.memory (replay buffer)
+        
+        input:
+            state("LazyFrame")
+            next_state("LazyFrame")
+            action("int")
+            reward("float")
+            done("bool")
+        """
+        def first_if_tuple(x):
+            return x[0] if isinstance(x, tuple) else x
+        state = first_if_tuple(state).__array__()
+        next_state = first_if_tuple(next_state).__array__()
+
+        state = torch.tensor(state, device=self.device)
+        next_state = torch.tensor(next_state, device=self.device)
+        action = torch.tensor([action], device=self.device)
+        reward = torch.tensor([reward], device=self.device)
+        done = torch.tensor([done], device=self.device)
+
+        self.memory.append((state, next_state, action, reward, done,))
 
     def recall(self):
-        pass
+        """
+        Search for experience in memory
+        """
+        batch = random.sample(self.memory, self.batch_size)
+        state, next_state, action, reward, done = map(torch.stack, zip(*batch))
+        return state, next_state, action.squeeze(), reward.squeeze(), done.squeeze()
+
+    def td_estimate(self, state, action):
+        current_Q = self.net(state, mode="online")[
+            np.arange(0, self.batch_size), action
+        ]   # Q_online(s, a)
+        return current_Q
+
+    @torch.no_grad()
+    def td_target(self, reward, next_state, done):
+        next_state_Q = self.net(next_state, model="online")
+        best_action = torch.argmax(next_state_Q, axis=1)
+        next_Q = self.net(next_state, model="target")[
+            np.arange(0, self.batch_size), best_action
+        ]
+        return (reward + (1 - done.float()) * self.gamma * next_Q).float()
+
+    def update_Q_online(self, td_estimate, td_target):
+        loss = self.loss_fn(td_estimate, td_target)
+        self.optimizer.zero_gard()
+        loss.backward()
+        self.optimizer.step()
+        return loss.item()
+
+    def sync_Q_target(self):
+        self.net.target.load_state_dict(self.net.online.state_dict())
+
+    def save(self):
+        save_path = (
+            self.save_dir / f"mario_net_{int(self.curr_step // self.save_every).chkpt}"
+        )
+        torch.save(
+            dict(model=self.net.state_dict(), exploration_rate=self.explorate_rate),
+            save_path,
+        )
+        print(f"MarioNet save to {save_path} at step {self.curr_step}")
 
     def learn(self):
-        pass
+        if self.curr_step % self.sync_every == 0:
+            self.sync_Q_target()
+
+        if self.curr_step % self.save_every == 0:
+            self.save()
+
+        if self.curr_step < self.burnin:
+            return None, None
+
+        if self.curr_step % self.learn_every != 0:
+            return None, None
+
+        # Sampling from memory
+        state, next_state, action, reward, done = self.recall()
+
+        # TD estimate value
+        td_est = self.td_estimate(state, action)
+
+        # TD target value
+        td_tgt = self.td_target(reward, next_state, done)
+
+        # update param with real-time Q
+        loss = self.update_Q_online(td_est, td_tgt)
+
+        return (td_est.mean().item(), loss)
+
+# DDQN Algorithm
+class MarioNet(nn.Module):
+    """
+    Small CNN structure
+    
+    input -> (conv2d + relu) * 3 -> flatten
+        -> (dense + relu) * 2 -> output
+    """
+    def __init__(self, input_dim, output_dim):
+        super().__init__()
+        c, h, w = input_dim
+
+        if h != 84:
+            raise ValueError(f"Expecting input height: 84, got: {h}")
+        if w != 84:
+            raise ValueError(f"Expecting input width: 84, got: {w}")
+
+        self.online = nn.Sequential(
+            nn.Conv2d(in_channels=c, out_channels=32, kernel_size=8, stride=4),
+            nn.ReLU(),
+            nn.Conv2d(in_channels=32, out_channels=64, kernel_size=4, stride=2),
+            nn.ReLU(),
+            nn.Conv2d(in_channels=64, out_channels=64, kernel_size=3, stride=1),
+            nn.ReLU(),
+            nn.Flatten(),
+            nn.Linear(3136, 512),
+            nn.ReLU(),
+            nn.Linear(512, output_dim)
+        )
+
+        self.target = copy.deepcopy(self.online)
+
+        # fix Q_target parameters
+        for p in self.target.parameters():
+            p.requires_grad = False
+
+    def forward(self, input, model):
+        if model == "online":
+            return self.online(input)
+        elif model == "target":
+            return self.target(input)

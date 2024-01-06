@@ -42,7 +42,7 @@ class GrayScaleObservation(gym.ObservationWrapper):
 
     def observation(self, observation):
         observation = self.permute_orientation(observation)
-        transfrom = T.Grayscale()
+        transform = T.Grayscale()
         observation = transform(observation)
         return observation
 
@@ -58,7 +58,7 @@ class ResizeObservation(gym.ObservationWrapper):
         self.observation_space = Box(low=0, high=255, shape=obs_shape, dtype=np.uint8)
 
     def observation(self, observation):
-        transforms = T.compos(
+        transforms = T.Compose(
             [T.Resize(self.shape), T.Normalize(0, 255)]
         )
         observation = transforms(observation).squeeze(0)
